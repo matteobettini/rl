@@ -408,6 +408,19 @@ class TanhNormal(FasterTransformedDistribution):
             m = t(m)
         return m
 
+    def log_prob(self, value):
+        log_prob = super().log_prob(value)
+        return clamp_preserve_gradients(log_prob, -20.0, 10)
+
+
+def clamp_preserve_gradients(x: torch.Tensor, min, max) -> torch.Tensor:
+    """Clamp with grad.
+
+    This helper function clamps gradients but still passes through the
+    gradient in clamped regions.
+    """
+    return x + (x.clamp(min, max) - x).detach()
+
 
 def uniform_sample_tanhnormal(dist: TanhNormal, size=None) -> torch.Tensor:
     """Defines what uniform sampling looks like for a TanhNormal distribution.
