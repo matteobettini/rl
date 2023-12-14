@@ -667,6 +667,7 @@ class VmasEnv(VmasWrapper):
         continuous_actions: bool = True,
         max_steps: Optional[int] = None,
         categorical_actions: bool = True,
+        clamp_actions: Optional[bool] = False,
         seed: Optional[int] = None,
         group_map: MarlGroupMapType | Dict[str, List[str]] | None = None,
         **kwargs,
@@ -679,6 +680,7 @@ class VmasEnv(VmasWrapper):
         kwargs["scenario"] = scenario
         kwargs["num_envs"] = num_envs
         kwargs["continuous_actions"] = continuous_actions
+        kwargs["clamp_actions"] = clamp_actions
         kwargs["max_steps"] = max_steps
         kwargs["seed"] = seed
         kwargs["categorical_actions"] = categorical_actions
@@ -698,6 +700,7 @@ class VmasEnv(VmasWrapper):
         continuous_actions: bool,
         max_steps: Optional[int],
         seed: Optional[int],
+        clamp_actions: Optional[bool],
         **scenario_kwargs,
     ) -> "vmas.simulator.environment.environment.Environment":  # noqa
         vmas = self.lib
@@ -714,6 +717,7 @@ class VmasEnv(VmasWrapper):
                 continuous_actions=continuous_actions,
                 max_steps=max_steps,
                 seed=seed,
+                clamp_actions=clamp_actions,
                 wrapper=None,
                 **scenario_kwargs,
             ),
