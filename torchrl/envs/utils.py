@@ -12,6 +12,7 @@ import importlib.util
 import inspect
 import os
 import re
+import warnings
 from enum import Enum
 from typing import Any, Dict, List, Union
 
@@ -20,6 +21,7 @@ import torch
 from tensordict import (
     is_tensor_collection,
     LazyStackedTensorDict,
+    TensorDict,
     TensorDictBase,
     unravel_key,
 )
@@ -41,6 +43,7 @@ from torchrl._utils import _replace_last, _rng_decorator, logger as torchrl_logg
 
 from torchrl.data.tensor_specs import (
     CompositeSpec,
+    NO_DEFAULT,
     TensorSpec,
     UnboundedContinuousTensorSpec,
 )
@@ -80,6 +83,206 @@ def _convert_exploration_type(*, exploration_mode, exploration_type):
 class _classproperty(property):
     def __get__(self, cls, owner):
         return classmethod(self.fget).__get__(None, owner)()
+
+
+class _StepMDP:
+    """Stateful version of step_mdp.
+
+    Precomputes the list of keys to include and exclude during a call to step_mdp
+    to reduce runtime.
+
+    """
+
+    def __init__(
+        self,
+        env,
+        *,
+        keep_other: bool = True,
+        exclude_reward: bool = True,
+        exclude_done: bool = False,
+        exclude_action: bool = True,
+    ):
+        action_keys = env.action_keys
+        done_keys = env.done_keys
+        reward_keys = env.reward_keys
+        observation_keys = env.full_observation_spec.keys(True, True)
+        state_keys = env.full_state_spec.keys(True, True)
+        self.action_keys = [unravel_key(key) for key in action_keys]
+        self.done_keys = [unravel_key(key) for key in done_keys]
+        self.reward_keys = [unravel_key(key) for key in reward_keys]
+        self.observation_keys = [unravel_key(key) for key in observation_keys]
+        self.state_keys = [unravel_key(key) for key in state_keys]
+
+        excluded = set()
+        if exclude_reward:
+            excluded = excluded.union(self.reward_keys)
+        if exclude_done:
+            excluded = excluded.union(self.done_keys)
+        if exclude_action:
+            excluded = excluded.union(self.action_keys)
+
+        self.excluded = [unravel_key(key) for key in excluded]
+
+        self.keep_other = keep_other
+        self.exclude_action = exclude_action
+
+        self.exclude_from_root = ["next", *self.done_keys]
+        self.keys_from_next = list(self.observation_keys)
+        if not exclude_reward:
+            self.keys_from_next += self.reward_keys
+        if not exclude_done:
+            self.keys_from_next += self.done_keys
+        self.keys_from_root = []
+        if not exclude_action:
+            self.keys_from_root += self.action_keys
+        else:
+            self.exclude_from_root += self.action_keys
+        if keep_other:
+            self.keys_from_root += self.state_keys
+        else:
+            self.exclude_from_root += self.state_keys
+
+        reset_keys = {_replace_last(key, "_reset") for key in self.done_keys}
+        self.exclude_from_root += list(reset_keys)
+        self.exclude_from_root += list(self.reward_keys)
+
+        self.exclude_from_root = self._repr_key_list_as_tree(self.exclude_from_root)
+        self.keys_from_root = self._repr_key_list_as_tree(self.keys_from_root)
+        self.keys_from_next = self._repr_key_list_as_tree(self.keys_from_next)
+        self.validated = None
+
+    def validate(self, tensordict):
+        if self.validated:
+            return True
+        if self.validated is None:
+            # check that the key set of the tensordict matches what is expected
+            expected = (
+                self.state_keys
+                + self.action_keys
+                + self.done_keys
+                + self.observation_keys
+                + [unravel_key(("next", key)) for key in self.observation_keys]
+                + [unravel_key(("next", key)) for key in self.done_keys]
+                + [unravel_key(("next", key)) for key in self.reward_keys]
+            )
+
+            def _is_reset(key: NestedKey):
+                if isinstance(key, str):
+                    return key == "_reset"
+                return key[-1] == "_reset"
+
+            actual = {key for key in tensordict.keys(True, True) if not _is_reset(key)}
+            expected = set(expected)
+            self.validated = expected.intersection(actual) == expected
+            if not self.validated:
+                warnings.warn(
+                    "The expected key set and actual key set differ. "
+                    "This will work but with a slower throughput than "
+                    "when the specs match exactly the actual key set "
+                    "in the data. "
+                    f"{{Expected keys}}-{{Actual keys}}={set(expected) - actual}, \n"
+                    f"{{Actual keys}}-{{Expected keys}}={actual- set(expected)}."
+                )
+        return self.validated
+
+    @staticmethod
+    def _repr_key_list_as_tree(key_list):
+        """Represents the keys as a tree to facilitate iteration."""
+        if not key_list:
+            return {}
+        key_dict = {key: torch.zeros(()) for key in key_list}
+        td = TensorDict(key_dict, batch_size=torch.Size([]))
+        return tree_map(lambda x: None, td.to_dict())
+
+    @classmethod
+    def _grab_and_place(
+        cls, nested_key_dict: dict, data_in: TensorDictBase, data_out: TensorDictBase
+    ):
+        for key, subdict in nested_key_dict.items():
+            val = data_in._get_str(key, NO_DEFAULT)
+            if subdict is not None:
+                val_out = data_out._get_str(key, None)
+                if val_out is None:
+                    val_out = val.empty()
+                if isinstance(val, LazyStackedTensorDict):
+
+                    val = LazyStackedTensorDict(
+                        *(
+                            cls._grab_and_place(subdict, _val, _val_out)
+                            for (_val, _val_out) in zip(
+                                val.unbind(val.stack_dim),
+                                val_out.unbind(val_out.stack_dim),
+                            )
+                        ),
+                        stack_dim=val.stack_dim,
+                    )
+                else:
+                    val = cls._grab_and_place(subdict, val, val_out)
+            data_out._set_str(
+                key, val, validated=True, inplace=False, non_blocking=False
+            )
+        return data_out
+
+    @classmethod
+    def _exclude(
+        cls, nested_key_dict: dict, data_in: TensorDictBase, out: TensorDictBase | None
+    ) -> None:
+        """Copies the entries if they're not part of the list of keys to exclude."""
+        if isinstance(data_in, LazyStackedTensorDict):
+            if out is None:
+                out = data_in.empty()
+            for td, td_out in zip(data_in.tensordicts, out.tensordicts):
+                cls._exclude(nested_key_dict, td, td_out)
+            return out
+        has_set = False
+        for key, value in data_in.items():
+            subdict = nested_key_dict.get(key, NO_DEFAULT)
+            if subdict is NO_DEFAULT:
+                value = value.copy() if is_tensor_collection(value) else value
+                if not has_set and out is None:
+                    out = data_in.empty()
+                out._set_str(key, value, validated=True, inplace=False)
+                has_set = True
+            elif subdict is not None:
+                value = cls._exclude(subdict, value, None)
+                if value is not None:
+                    if not has_set and out is None:
+                        out = data_in.empty()
+                    out._set_str(key, value, validated=True, inplace=False)
+                    has_set = True
+        if has_set:
+            return out
+
+    def __call__(self, tensordict):
+        if isinstance(tensordict, LazyStackedTensorDict):
+            out = LazyStackedTensorDict.lazy_stack(
+                [self.__call__(td) for td in tensordict.tensordicts],
+                tensordict.stack_dim,
+            )
+            return out
+
+        next_td = tensordict._get_str("next", None)
+        if self.validate(tensordict):
+            if self.keep_other:
+                out = self._exclude(self.exclude_from_root, tensordict, out=None)
+            else:
+                out = next_td.empty()
+                self._grab_and_place(self.keys_from_root, tensordict, out)
+            self._grab_and_place(self.keys_from_next, next_td, out)
+            return out
+        else:
+            out = next_td.empty()
+            total_key = ()
+            if self.keep_other:
+                for key in tensordict.keys():
+                    if key != "next":
+                        _set(tensordict, out, key, total_key, self.excluded)
+            elif not self.exclude_action:
+                for action_key in self.action_keys:
+                    _set_single_key(tensordict, out, action_key)
+            for key in next_td.keys():
+                _set(next_td, out, key, total_key, self.excluded)
+            return out
 
 
 def step_mdp(
@@ -269,7 +472,9 @@ def _set_single_key(
                 new_val = dest._get_str(k, None)
                 if new_val is None:
                     new_val = val.empty()
-                    dest._set_str(k, new_val, inplace=False, validated=True)
+                    dest._set_str(
+                        k, new_val, inplace=False, validated=True, non_blocking=False
+                    )
                 source = val
                 dest = new_val
             else:
@@ -277,7 +482,7 @@ def _set_single_key(
                     val = val.to(device, non_blocking=True)
                 elif clone:
                     val = val.clone()
-                dest._set_str(k, val, inplace=False, validated=True)
+                dest._set_str(k, val, inplace=False, validated=True, non_blocking=False)
         # This is a temporary solution to understand if a key is heterogeneous
         # while not having performance impact when the exception is not raised
         except RuntimeError as err:
@@ -297,6 +502,7 @@ def _set(source, dest, key, total_key, excluded):
         try:
             val = source.get(key)
             if is_tensor_collection(val):
+                # if val is a tensordict we need to copy the structure
                 new_val = dest.get(key, None)
                 if new_val is None:
                     new_val = val.empty()
@@ -308,12 +514,16 @@ def _set(source, dest, key, total_key, excluded):
                     )
                 if non_empty_local:
                     # dest.set(key, new_val)
-                    dest._set_str(key, new_val, inplace=False, validated=True)
+                    dest._set_str(
+                        key, new_val, inplace=False, validated=True, non_blocking=False
+                    )
                 non_empty = non_empty_local
             else:
                 non_empty = True
                 # dest.set(key, val)
-                dest._set_str(key, val, inplace=False, validated=True)
+                dest._set_str(
+                    key, val, inplace=False, validated=True, non_blocking=False
+                )
         # This is a temporary solution to understand if a key is heterogeneous
         # while not having performance impact when the exception is not raised
         except RuntimeError as err:
@@ -1145,7 +1355,6 @@ def _make_compatible_policy(policy, observation_spec, env=None, fast_wrap=False)
             )
 
         try:
-            # signature modified by make_functional
             sig = policy.forward.__signature__
         except AttributeError:
             sig = inspect.signature(policy.forward)

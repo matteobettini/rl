@@ -39,7 +39,9 @@ from torch.utils.data import IterableDataset
 
 from torchrl._utils import (
     _check_for_faulty_process,
+    _ends_with,
     _ProcessNoWarn,
+    _replace_last,
     accept_remote_rref_udf_invocation,
     logger as torchrl_logger,
     prod,
@@ -49,7 +51,7 @@ from torchrl._utils import (
 from torchrl.collectors.utils import split_trajectories
 from torchrl.data.tensor_specs import TensorSpec
 from torchrl.data.utils import CloudpickleWrapper, DEVICE_TYPING
-from torchrl.envs.common import EnvBase
+from torchrl.envs.common import _do_nothing, EnvBase
 from torchrl.envs.transforms import StepCounter, TransformedEnv
 from torchrl.envs.utils import (
     _aggregate_end_of_traj,
@@ -235,6 +237,9 @@ class DataCollectorBase(IterableDataset, metaclass=abc.ABCMeta):
         string = f"{self.__class__.__name__}()"
         return string
 
+    def __class_getitem__(self, index):
+        raise NotImplementedError
+
 
 @accept_remote_rref_udf_invocation
 class SyncDataCollector(DataCollectorBase):
@@ -343,6 +348,11 @@ class SyncDataCollector(DataCollectorBase):
             The _Interruptor class has methods ´start_collection´ and ´stop_collection´, which allow to implement
             strategies such as preeptively stopping rollout collection.
             Default is ``False``.
+        set_truncated (bool, optional): if ``True``, the truncated signals (and corresponding
+            ``"done"`` but not ``"terminated"``) will be set to ``True`` when the last frame of
+            a rollout is reached. If no ``"truncated"`` key is found, an exception is raised.
+            Truncated keys can be set through ``env.add_truncated_keys``.
+            Defaults to ``False``.
 
     Examples:
         >>> from torchrl.envs.libs.gym import GymEnv
@@ -426,10 +436,11 @@ class SyncDataCollector(DataCollectorBase):
         postproc: Callable[[TensorDictBase], TensorDictBase] | None = None,
         split_trajs: bool | None = None,
         exploration_type: ExplorationType = DEFAULT_EXPLORATION_TYPE,
-        exploration_mode=None,
+        exploration_mode: str | None = None,
         return_same_td: bool = False,
         reset_when_done: bool = True,
         interruptor=None,
+        set_truncated: bool = False,
     ):
         from torchrl.envs.batched_envs import BatchedEnvBase
 
@@ -469,8 +480,45 @@ class SyncDataCollector(DataCollectorBase):
         )
 
         self.storing_device = storing_device
+        if self.storing_device is not None and self.storing_device.type != "cuda":
+            # Cuda handles sync
+            if torch.cuda.is_available():
+                self._sync_storage = torch.cuda.synchronize
+            elif torch.backends.mps.is_available():
+                self._sync_storage = torch.mps.synchronize
+            elif self.storing_device.type == "cpu":
+                self._sync_storage = _do_nothing
+            else:
+                raise RuntimeError("Non supported device")
+        else:
+            self._sync_storage = _do_nothing
+
         self.env_device = env_device
+        if self.env_device is not None and self.env_device.type != "cuda":
+            # Cuda handles sync
+            if torch.cuda.is_available():
+                self._sync_env = torch.cuda.synchronize
+            elif torch.backends.mps.is_available():
+                self._sync_env = torch.mps.synchronize
+            elif self.env_device.type == "cpu":
+                self._sync_env = _do_nothing
+            else:
+                raise RuntimeError("Non supported device")
+        else:
+            self._sync_env = _do_nothing
         self.policy_device = policy_device
+        if self.policy_device is not None and self.policy_device.type != "cuda":
+            # Cuda handles sync
+            if torch.cuda.is_available():
+                self._sync_policy = torch.cuda.synchronize
+            elif torch.backends.mps.is_available():
+                self._sync_policy = torch.mps.synchronize
+            elif self.policy_device.type == "cpu":
+                self._sync_policy = _do_nothing
+            else:
+                raise RuntimeError("Non supported device")
+        else:
+            self._sync_policy = _do_nothing
         self.device = device
         # Check if we need to cast things from device to device
         # If the policy has a None device and the env too, no need to cast (we don't know
@@ -500,8 +548,15 @@ class SyncDataCollector(DataCollectorBase):
         if self.env_device:
             self.env: EnvBase = self.env.to(self.env_device)
         elif self.env.device is not None:
-            # we we did not receive an env device, we use the device of the env
+            # we did not receive an env device, we use the device of the env
             self.env_device = self.env.device
+
+        # If the storing device is not the same as the policy device, we have
+        # no guarantee that the "next" entry from the policy will be on the
+        # same device as the collector metadata.
+        self._cast_to_env_device = self._cast_to_policy_device or (
+            self.env.device != self.storing_device
+        )
 
         self.max_frames_per_traj = (
             int(max_frames_per_traj) if max_frames_per_traj is not None else 0
@@ -723,6 +778,23 @@ class SyncDataCollector(DataCollectorBase):
         self.interruptor = interruptor
         self._frames = 0
         self._iter = -1
+        self.set_truncated = set_truncated
+        self._truncated_keys = []
+        if self.set_truncated:
+            if not any(
+                _ends_with(key, "truncated")
+                for key in self._final_rollout.keys(True, True)
+            ):
+                raise RuntimeError(
+                    "set_truncated was set to True but no truncated key could be found "
+                    "in the environment. Make sure the truncated keys are properly set using "
+                    "`env.add_truncated_keys()` before passing the env to the collector."
+                )
+            self._truncated_keys = [
+                key
+                for key in self._final_rollout["next"].keys(True, True)
+                if _ends_with(key, "truncated")
+            ]
 
     @classmethod
     def _get_devices(
@@ -905,6 +977,7 @@ class SyncDataCollector(DataCollectorBase):
                             policy_input = self._shuttle.to(
                                 self.policy_device, non_blocking=True
                             )
+                            self._sync_policy()
                         elif self.policy_device is None:
                             # we know the tensordict has a device otherwise we would not be here
                             # we can pass this, clear_device_ must have been called earlier
@@ -920,9 +993,10 @@ class SyncDataCollector(DataCollectorBase):
                             policy_output, keys_to_update=self._policy_output_keys
                         )
 
-                if self._cast_to_policy_device:
+                if self._cast_to_env_device:
                     if self.env_device is not None:
                         env_input = self._shuttle.to(self.env_device, non_blocking=True)
+                        self._sync_env()
                     elif self.env_device is None:
                         # we know the tensordict has a device otherwise we would not be here
                         # we can pass this, clear_device_ must have been called earlier
@@ -944,6 +1018,7 @@ class SyncDataCollector(DataCollectorBase):
                     tensordicts.append(
                         self._shuttle.to(self.storing_device, non_blocking=True)
                     )
+                    self._sync_storage()
                 else:
                     tensordicts.append(self._shuttle)
 
@@ -964,14 +1039,14 @@ class SyncDataCollector(DataCollectorBase):
                         torch.stack(
                             tensordicts,
                             self._final_rollout.ndim - 1,
-                            out=self._final_rollout[: t + 1],
+                            out=self._final_rollout[..., : t + 1],
                         )
                     except RuntimeError:
                         with self._final_rollout.unlock_():
                             torch.stack(
                                 tensordicts,
                                 self._final_rollout.ndim - 1,
-                                out=self._final_rollout[: t + 1],
+                                out=self._final_rollout[..., : t + 1],
                             )
                     break
             else:
@@ -988,17 +1063,16 @@ class SyncDataCollector(DataCollectorBase):
                             self._final_rollout.ndim - 1,
                             out=self._final_rollout,
                         )
-        return self._final_rollout
+        return self._maybe_set_truncated(self._final_rollout)
 
-    @staticmethod
-    def _update_device_wise(tensor0, tensor1):
-        # given 2 tensors, returns tensor0 if their identity matches,
-        # or a copy of tensor1 on the device of tensor0 otherwise
-        if tensor1 is None or tensor1 is tensor0:
-            return tensor0
-        if tensor1.device == tensor0.device:
-            return tensor1
-        return tensor1.to(tensor0.device, non_blocking=True)
+    def _maybe_set_truncated(self, final_rollout):
+        last_step = (slice(None),) * (final_rollout.ndim - 1) + (-1,)
+        for truncated_key in self._truncated_keys:
+            truncated = final_rollout["next", truncated_key]
+            truncated[last_step] = True
+            final_rollout["next", truncated_key] = truncated
+            final_rollout["next", _replace_last(truncated_key, "done")] = truncated
+        return final_rollout
 
     @torch.no_grad()
     def reset(self, index=None, **kwargs) -> None:
@@ -1228,6 +1302,26 @@ class _MultiDataCollector(DataCollectorBase):
             each subprocess (or one if a single process is launched).
             Defaults to 1 for safety: if none is indicated, launching multiple
             workers may charge the cpu load too much and harm performance.
+        cat_results (str, int or None): (:class:`~torchrl.collectors.MultiSyncDataCollector` exclusively).
+            If ``"stack"``, the data collected from the workers will be stacked along the
+            first dimension. This is the preferred behaviour as it is the most compatible
+            with the rest of the library.
+            If ``0``, results will be concatenated along the first dimension
+            of the outputs, which can be the batched dimension if the environments are
+            batched or the time dimension if not.
+            A ``cat_results`` value of ``-1`` will always concatenate results along the
+            time dimension. This should be preferred over the default. Intermediate values
+            are also accepted.
+            Defaults to ``0``.
+
+            .. note:: From v0.5, this argument will default to ``"stack"`` for a better
+                interoperability with the rest of the library.
+
+        set_truncated (bool, optional): if ``True``, the truncated signals (and corresponding
+            ``"done"`` but not ``"terminated"``) will be set to ``True`` when the last frame of
+            a rollout is reached. If no ``"truncated"`` key is found, an exception is raised.
+            Truncated keys can be set through ``env.add_truncated_keys``.
+            Defaults to ``False``.
 
     """
 
@@ -1260,6 +1354,8 @@ class _MultiDataCollector(DataCollectorBase):
         preemptive_threshold: float = None,
         num_threads: int = None,
         num_sub_threads: int = 1,
+        cat_results: str | int | None = None,
+        set_truncated: bool = False,
     ):
         exploration_type = _convert_exploration_type(
             exploration_mode=exploration_mode, exploration_type=exploration_type
@@ -1267,6 +1363,7 @@ class _MultiDataCollector(DataCollectorBase):
         self.closed = True
         self.num_workers = len(create_env_fn)
 
+        self.set_truncated = set_truncated
         self.num_sub_threads = num_sub_threads
         self.num_threads = num_threads
         self.create_env_fn = create_env_fn
@@ -1418,6 +1515,22 @@ class _MultiDataCollector(DataCollectorBase):
         self._exclude_private_keys = True
         self._frames = 0
         self._iter = -1
+        if cat_results is not None and (
+            not isinstance(cat_results, (int, str))
+            or (isinstance(cat_results, str) and cat_results != "stack")
+        ):
+            raise ValueError(
+                "cat_results must be a string ('stack') "
+                f"or an integer representing the cat dimension. Got {cat_results}."
+            )
+        if not isinstance(self, MultiSyncDataCollector) and cat_results not in (
+            "stack",
+            None,
+        ):
+            raise ValueError(
+                "cat_results can only be used with ``MultiSyncDataCollector``."
+            )
+        self.cat_results = cat_results
 
     @classmethod
     def _total_workers_from_env(cls, env_creators):
@@ -1547,6 +1660,7 @@ class _MultiDataCollector(DataCollectorBase):
                     "reset_when_done": self.reset_when_done,
                     "idx": i,
                     "interruptor": self.interruptor,
+                    "set_truncated": self.set_truncated,
                 }
                 proc = _ProcessNoWarn(
                     target=_main_async_collector,
@@ -1768,7 +1882,7 @@ class MultiSyncDataCollector(_MultiDataCollector):
     The collection starts when the next item of the collector is queried,
     and no environment step is computed in between the reception of a batch of
     trajectory and the start of the next collection.
-    This class can be safely used with online RL algorithms.
+    This class can be safely used with online RL sota-implementations.
 
     Examples:
         >>> from torchrl.envs.libs.gym import GymEnv
@@ -1874,11 +1988,33 @@ class MultiSyncDataCollector(_MultiDataCollector):
 
     def iterator(self) -> Iterator[TensorDictBase]:
 
+        cat_results = self.cat_results
+        if cat_results is None:
+            cat_results = 0
+            warnings.warn(
+                f"`cat_results` was not specified in the constructor of {type(self).__name__}. "
+                f"For MultiSyncDataCollector, `cat_results` indicates how the data should "
+                f"be packed: the preferred option is `cat_results='stack'` which provides "
+                f"the best interoperability across torchrl components. "
+                f"Other accepted values are `cat_results=0` (previous behaviour) and "
+                f"`cat_results=-1` (cat along time dimension). Among these two, the latter "
+                f"should be preferred for consistency across environment configurations. "
+                f"Currently, the default value is `0` (using torch.cat along first dimension)."
+                f"From v0.5 onward, this will default to `'stack'`. "
+                f"To suppress this warning, set stack_results to the desired value.",
+                category=DeprecationWarning,
+            )
+
         self.buffers = {}
         dones = [False for _ in range(self.num_workers)]
         workers_frames = [0 for _ in range(self.num_workers)]
         same_device = None
         self.out_buffer = None
+        last_traj_ids = [-10 for _ in range(self.num_workers)]
+        last_traj_ids_subs = [None for _ in range(self.num_workers)]
+        traj_max = -1
+        traj_ids_list = [None for _ in range(self.num_workers)]
+        preempt = self.interruptor is not None and self.preemptive_threshold < 1.0
 
         while not all(dones) and self._frames < self.total_frames:
             _check_for_faulty_process(self.procs)
@@ -1896,9 +2032,8 @@ class MultiSyncDataCollector(_MultiDataCollector):
                 self.pipes[idx].send((None, msg))
 
             self._iter += 1
-            max_traj_idx = None
 
-            if self.interruptor is not None and self.preemptive_threshold < 1.0:
+            if preempt:
                 self.interruptor.start_collection()
                 while self.queue_out.qsize() < int(
                     self.num_workers * self.preemptive_threshold
@@ -1916,18 +2051,81 @@ class MultiSyncDataCollector(_MultiDataCollector):
                     self.buffers[idx] = data
                 else:
                     idx = new_data
-                workers_frames[idx] = workers_frames[idx] + self.buffers[idx].numel()
+                    data = self.buffers[idx]
+
+                if preempt:
+                    # mask buffers if cat, and create a mask if stack
+                    if cat_results != "stack":
+                        buffers = {}
+                        for idx, buffer in self.buffers.items():
+                            valid = buffer.get(("collector", "traj_ids")) != -1
+                            if valid.ndim > 2:
+                                valid = valid.flatten(0, -2)
+                            if valid.ndim == 2:
+                                valid = valid.any(0)
+                            buffers[idx] = buffer[..., valid]
+                    else:
+                        for buffer in self.buffers.values():
+                            with buffer.unlock_():
+                                buffer.set(
+                                    ("collector", "mask"),
+                                    buffer.get(("collector", "traj_ids")) != -1,
+                                )
+                        buffers = self.buffers
+                else:
+                    buffers = self.buffers
+
+                workers_frames[idx] = workers_frames[idx] + buffers[idx].numel()
 
                 if workers_frames[idx] >= self.total_frames:
                     dones[idx] = True
+
             # we have to correct the traj_ids to make sure that they don't overlap
+            # We can count the number of frames collected for free in this loop
+            n_collected = 0
             for idx in range(self.num_workers):
-                traj_ids = self.buffers[idx].get(("collector", "traj_ids"))
-                if max_traj_idx is not None:
-                    traj_ids[traj_ids != -1] += max_traj_idx
-                    # out_tensordicts_shared[idx].set("traj_ids", traj_ids)
-                max_traj_idx = traj_ids.max().item() + 1
-                # out = out_tensordicts_shared[idx]
+                buffer = buffers[idx]
+                traj_ids = buffer.get(("collector", "traj_ids"))
+                is_last = traj_ids == last_traj_ids[idx]
+                # If we `cat` interrupted data, we have already filtered out
+                # non-valid steps. If we stack, we haven't.
+                if preempt and cat_results == "stack":
+                    valid = buffer.get(("collector", "traj_ids")) != -1
+                    if valid.ndim > 2:
+                        valid = valid.flatten(0, -2)
+                    if valid.ndim == 2:
+                        valid = valid.any(0)
+                    last_traj_ids[idx] = traj_ids[..., valid][..., -1:].clone()
+                else:
+                    last_traj_ids[idx] = traj_ids[..., -1:].clone()
+                if not is_last.all():
+                    traj_to_correct = traj_ids[~is_last]
+                    traj_to_correct = (
+                        traj_to_correct + (traj_max + 1) - traj_to_correct.min()
+                    )
+                    traj_ids = traj_ids.masked_scatter(~is_last, traj_to_correct)
+                # is_last can only be true if we're after the first iteration
+                if is_last.any():
+                    traj_ids = torch.where(
+                        is_last, last_traj_ids_subs[idx].expand_as(traj_ids), traj_ids
+                    )
+
+                if preempt:
+                    if cat_results == "stack":
+                        mask_frames = buffer.get(("collector", "traj_ids")) != -1
+                        traj_ids = torch.where(mask_frames, traj_ids, -1)
+                        n_collected += mask_frames.sum().cpu()
+                        last_traj_ids_subs[idx] = traj_ids[..., valid][..., -1:].clone()
+                    else:
+                        last_traj_ids_subs[idx] = traj_ids[..., -1:].clone()
+                        n_collected += traj_ids.numel()
+                else:
+                    last_traj_ids_subs[idx] = traj_ids[..., -1:].clone()
+                    n_collected += traj_ids.numel()
+                traj_ids_list[idx] = traj_ids
+
+                traj_max = max(traj_max, traj_ids.max())
+
             if same_device is None:
                 prev_device = None
                 same_device = True
@@ -1937,23 +2135,49 @@ class MultiSyncDataCollector(_MultiDataCollector):
                     else:
                         same_device = same_device and (item.device == prev_device)
 
-            if same_device:
-                self.out_buffer = torch.cat(
-                    list(self.buffers.values()), 0, out=self.out_buffer
+            if cat_results == "stack":
+                if same_device:
+                    self.out_buffer = torch.stack(list(buffers.values()), 0)
+                else:
+                    self.out_buffer = torch.stack(
+                        [item.cpu() for item in buffers.values()], 0
+                    )
+                self.out_buffer.set_(
+                    ("collector", "traj_ids"), torch.stack(traj_ids_list)
                 )
             else:
-                self.out_buffer = torch.cat(
-                    [item.cpu() for item in self.buffers.values()],
-                    0,
-                    out=self.out_buffer,
-                )
+                try:
+                    if same_device:
+                        self.out_buffer = torch.cat(list(buffers.values()), cat_results)
+                    else:
+                        self.out_buffer = torch.cat(
+                            [item.cpu() for item in buffers.values()], cat_results
+                        )
+                    self.out_buffer.set_(
+                        ("collector", "traj_ids"), torch.cat(traj_ids_list, cat_results)
+                    )
+                except RuntimeError as err:
+                    if (
+                        preempt
+                        and cat_results != -1
+                        and "Sizes of tensors must match" in str(err)
+                    ):
+                        raise RuntimeError(
+                            "The value provided to cat_results isn't compatible with the collectors outputs. "
+                            "Consider using `cat_results=-1`."
+                        )
+                    raise
 
+            # TODO: why do we need to do cat inplace and clone?
             if self.split_trajs:
                 out = split_trajectories(self.out_buffer, prefix="collector")
-                self._frames += out.get(("collector", "mask")).sum().item()
             else:
-                out = self.out_buffer.clone()
-                self._frames += prod(out.shape)
+                out = self.out_buffer
+            if cat_results in (-1, "stack"):
+                out.refine_names(*[None] * (out.ndim - 1) + ["time"])
+
+            self._frames += n_collected
+
             if self.postprocs:
                 self.postprocs = self.postprocs.to(out.device)
                 out = self.postprocs(out)
@@ -1965,6 +2189,7 @@ class MultiSyncDataCollector(_MultiDataCollector):
             del out
 
         del self.buffers
+        self.out_buffer = None
         # We shall not call shutdown just yet as user may want to retrieve state_dict
         # self._shutdown_main()
 
@@ -2005,7 +2230,7 @@ class MultiaSyncDataCollector(_MultiDataCollector):
 
     The collection keeps on occuring on all processes even between the time
     the batch of rollouts is collected and the next call to the iterator.
-    This class can be safely used with offline RL algorithms.
+    This class can be safely used with offline RL sota-implementations.
 
     Examples:
         >>> from torchrl.envs.libs.gym import GymEnv
@@ -2311,6 +2536,11 @@ class aSyncDataCollector(MultiaSyncDataCollector):
             each subprocess (or one if a single process is launched).
             Defaults to 1 for safety: if none is indicated, launching multiple
             workers may charge the cpu load too much and harm performance.
+        set_truncated (bool, optional): if ``True``, the truncated signals (and corresponding
+            ``"done"`` but not ``"terminated"``) will be set to ``True`` when the last frame of
+            a rollout is reached. If no ``"truncated"`` key is found, an exception is raised.
+            Truncated keys can be set through ``env.add_truncated_keys``.
+            Defaults to ``False``.
 
     """
 
@@ -2343,6 +2573,7 @@ class aSyncDataCollector(MultiaSyncDataCollector):
         preemptive_threshold: float = None,
         num_threads: int = None,
         num_sub_threads: int = 1,
+        set_truncated: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -2367,6 +2598,7 @@ class aSyncDataCollector(MultiaSyncDataCollector):
             preemptive_threshold=preemptive_threshold,
             num_threads=num_threads,
             num_sub_threads=num_sub_threads,
+            set_truncated=set_truncated,
         )
 
     # for RPC
@@ -2408,6 +2640,7 @@ def _main_async_collector(
     reset_when_done: bool = True,
     verbose: bool = VERBOSE,
     interruptor=None,
+    set_truncated: bool = False,
 ) -> None:
     pipe_parent.close()
     # init variables that will be cleared when closing
@@ -2430,6 +2663,7 @@ def _main_async_collector(
         reset_when_done=reset_when_done,
         return_same_td=True,
         interruptor=interruptor,
+        set_truncated=set_truncated,
     )
     if verbose:
         torchrl_logger.info("Sync data collector created")

@@ -22,7 +22,7 @@ from tensordict.utils import NestedKey
 
 from torchrl._extension import EXTENSION_WARNING
 
-from torchrl._utils import _replace_last
+from torchrl._utils import _replace_last, logger
 from torchrl.data.replay_buffers.storages import Storage, StorageEnsemble, TensorStorage
 from torchrl.data.replay_buffers.utils import _is_int
 
@@ -54,7 +54,7 @@ class Sampler(ABC):
 
     def update_priority(
         self, index: Union[int, torch.Tensor], priority: Union[float, torch.Tensor]
-    ) -> dict:
+    ) -> dict | None:
         return
 
     def mark_update(self, index: Union[int, torch.Tensor]) -> None:
@@ -88,6 +88,9 @@ class Sampler(ABC):
     @abstractmethod
     def loads(self, path):
         ...
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}()"
 
 
 class RandomSampler(Sampler):
@@ -174,10 +177,12 @@ class SamplerWithoutReplacement(Sampler):
             device = self._sample_list.device
         else:
             device = storage.device if hasattr(storage, "device") else None
+
         if self.shuffle:
-            self._sample_list = torch.randperm(len_storage, device=device)
+            _sample_list = torch.randperm(len_storage, device=device)
         else:
-            self._sample_list = torch.arange(len_storage, device=device)
+            _sample_list = torch.arange(len_storage, device=device)
+        self._sample_list = _sample_list
 
     def _single_sample(self, len_storage, batch_size):
         index = self._sample_list[:batch_size]
@@ -185,7 +190,7 @@ class SamplerWithoutReplacement(Sampler):
 
         # check if we have enough elements for one more batch, assuming same batch size
         # will be used each time sample is called
-        if self._sample_list.numel() == 0 or (
+        if self._sample_list.shape[0] == 0 or (
             self.drop_last and len(self._sample_list) < batch_size
         ):
             self.ran_out = True
@@ -198,7 +203,6 @@ class SamplerWithoutReplacement(Sampler):
         return len(storage)
 
     def sample(self, storage: Storage, batch_size: int) -> Tuple[Any, dict]:
-        storage = storage.flatten()
         len_storage = self._storage_len(storage)
         if len_storage == 0:
             raise RuntimeError(_EMPTY_STORAGE_ERROR)
@@ -214,8 +218,10 @@ class SamplerWithoutReplacement(Sampler):
             )
         self.len_storage = len_storage
         index = self._single_sample(len_storage, batch_size)
+        if storage.ndim > 1:
+            index = torch.unravel_index(index, storage.shape)
         # we 'always' return the indices. The 'drop_last' just instructs the
-        # sampler to turn to 'ran_out = True` whenever the next sample
+        # sampler to turn to `ran_out = True` whenever the next sample
         # will be too short. This will be read by the replay buffer
         # as a signal for an early break of the __iter__().
         return index, {}
@@ -246,6 +252,13 @@ class SamplerWithoutReplacement(Sampler):
         self._sample_list = state_dict["_sample_list"]
         self.drop_last = state_dict["drop_last"]
         self._ran_out = state_dict["_ran_out"]
+
+    def __repr__(self):
+        if self._sample_list is not None:
+            perc = len(self._sample_list) / self.len_storage * 100
+        else:
+            perc = 0.0
+        return f"{self.__class__.__name__}({perc: 4.4f}% sampled)"
 
 
 class PrioritizedSampler(Sampler):
@@ -334,6 +347,9 @@ class PrioritizedSampler(Sampler):
         self.reduction = reduction
         self.dtype = dtype
         self._init()
+
+    def __repr__(self):
+        return f"{self.__class__.__name__}(alpha={self._alpha}, beta={self._beta}, eps={self._eps}, reduction={self.reduction})"
 
     @property
     def max_size(self):
@@ -461,7 +477,7 @@ class PrioritizedSampler(Sampler):
         """
         priority = torch.as_tensor(priority, device=torch.device("cpu")).detach()
         index = torch.as_tensor(index, dtype=torch.long, device=torch.device("cpu"))
-        # we need to reshape priority if it has more than one elements or if it has
+        # we need to reshape priority if it has more than one element or if it has
         # a different shape than index
         if priority.numel() > 1 and priority.shape != index.shape:
             try:
@@ -610,12 +626,36 @@ class SliceSampler(Sampler):
             To be used whenever the ``end_key`` or ``traj_key`` is expensive to get,
             or when this signal is readily available. Must be used with ``cache_values=True``
             and cannot be used in conjunction with ``end_key`` or ``traj_key``.
+            If provided, it is assumed that the storage is at capacity and that
+            if the last element of the ``ends`` tensor is ``False``,
+            the same trajectory spans across end and beginning.
         trajectories (torch.Tensor, optional): a 1d integer tensor containing the run ids.
             To be used whenever the ``end_key`` or ``traj_key`` is expensive to get,
             or when this signal is readily available. Must be used with ``cache_values=True``
             and cannot be used in conjunction with ``end_key`` or ``traj_key``.
+            If provided, it is assumed that the storage is at capacity and that
+            if the last element of the trajectory tensor is identical to the first,
+            the same trajectory spans across end and beginning.
         cache_values (bool, optional): to be used with static datasets.
-            Will cache the start and end signal of the trajectory.
+            Will cache the start and end signal of the trajectory. This can be safely used even
+            if the trajectory indices change during calls to :class:`~torchrl.data.ReplayBuffer.extend`
+            as this operation will erase the cache.
+
+            .. warning:: ``cache_values=True`` will not work if the sampler is used with a
+                storage that is extended by another buffer. For instance:
+
+                    >>> buffer0 = ReplayBuffer(storage=storage,
+                    ...     sampler=SliceSampler(num_slices=8, cache_values=True),
+                    ...     writer=ImmutableWriter())
+                    >>> buffer1 = ReplayBuffer(storage=storage,
+                    ...     sampler=other_sampler)
+                    >>> # Wrong! Does not erase the buffer from the sampler of buffer0
+                    >>> buffer1.extend(data)
+
+            .. warning:: ``cache_values=True`` will not work as expected if the buffer is
+                shared between processes and one process is responsible for writing
+                and one process for sampling, as erasing the cache can only be done locally.
+
         truncated_key (NestedKey, optional): If not ``None``, this argument
             indicates where a truncated signal should be written in the output
             data. This is used to indicate to value estimators where the provided
@@ -625,10 +665,15 @@ class SliceSampler(Sampler):
             returned by the :meth:`~torchrl.data.replay_buffers.ReplayBuffer.sample` method).
         strict_length (bool, optional): if ``False``, trajectories of length
             shorter than `slice_len` (or `batch_size // num_slices`) will be
-            allowed to appear in the batch.
+            allowed to appear in the batch. If ``True``, trajectories shorted
+            than required will be filtered out.
             Be mindful that this can result in effective `batch_size`  shorter
             than the one asked for! Trajectories can be split using
             :func:`~torchrl.collectors.split_trajectories`. Defaults to ``True``.
+        compile (bool or dict of kwargs, optional): if ``True``, the bottleneck of
+            the :meth:`~sample` method will be compiled with :func:`~torch.compile`.
+            Keyword arguments can also be passed to torch.compile with this arg.
+            Defaults to ``False``.
 
     .. note:: To recover the trajectory splits in the storage,
         :class:`~torchrl.data.replay_buffers.samplers.SliceSampler` will first
@@ -707,6 +752,7 @@ class SliceSampler(Sampler):
         cache_values: bool = False,
         truncated_key: NestedKey | None = ("next", "truncated"),
         strict_length: bool = True,
+        compile: bool | dict = False,
     ):
         self.num_slices = num_slices
         self.slice_len = slice_len
@@ -728,7 +774,10 @@ class SliceSampler(Sampler):
                 raise RuntimeError(
                     "To be used, trajectories requires `cache_values` to be set to `True`."
                 )
-            vals = self._find_start_stop_traj(trajectory=trajectories)
+            vals = self._find_start_stop_traj(
+                trajectory=trajectories,
+                at_capacity=True,
+            )
             self._cache["stop-and-length"] = vals
 
         elif ends is not None:
@@ -742,7 +791,7 @@ class SliceSampler(Sampler):
                 raise RuntimeError(
                     "To be used, ends requires `cache_values` to be set to `True`."
                 )
-            vals = self._find_start_stop_traj(end=ends)
+            vals = self._find_start_stop_traj(end=ends, at_capacity=True)
             self._cache["stop-and-length"] = vals
 
         else:
@@ -758,9 +807,44 @@ class SliceSampler(Sampler):
                 "Either num_slices or slice_len must be not None, and not both. "
                 f"Got num_slices={num_slices} and slice_len={slice_len}."
             )
+        self.compile = bool(compile)
+        if self.compile:
+            if isinstance(compile, dict):
+                kwargs = compile
+            else:
+                kwargs = {}
+            self._get_index = torch.compile(self._get_index, **kwargs)
 
-    @staticmethod
-    def _find_start_stop_traj(*, trajectory=None, end=None):
+    def __getstate__(self):
+        if get_spawning_popen() is not None and self.cache_values:
+            logger.warning(
+                f"It seems you are sharing a {type(self).__name__} across processes with"
+                f"cache_values=True. "
+                f"While this isn't forbidden and could perfectly work if your dataset "
+                f"is unaltered on both processes, remember that calling extend/add on"
+                f"one process will NOT erase the cache on another process's sampler, "
+                f"which will cause synchronization issues."
+            )
+        state = copy(self.__dict__)
+        state["_cache"] = {}
+        return state
+
+    def extend(self, index: torch.Tensor) -> None:
+        if self.cache_values:
+            self._cache.clear()
+
+    def __repr__(self):
+        return (
+            f"{self.__class__.__name__}(num_slices={self.num_slices}, "
+            f"slice_len={self.slice_len}, "
+            f"end_key={self.end_key}, "
+            f"traj_key={self.traj_key}, "
+            f"truncated_key={self.truncated_key}, "
+            f"strict_length={self.strict_length})"
+        )
+
+    @classmethod
+    def _find_start_stop_traj(cls, *, trajectory=None, end=None, at_capacity: bool):
         if trajectory is not None:
             # slower
             # _, stop_idx = torch.unique_consecutive(trajectory, return_counts=True)
@@ -773,55 +857,91 @@ class SliceSampler(Sampler):
 
             # faster
             end = trajectory[:-1] != trajectory[1:]
-            end = torch.cat([end, torch.ones_like(end[:1])], 0)
+            end = torch.cat([end, trajectory[-1:] != trajectory[:1]], 0)
+            length = trajectory.shape[0]
         else:
+            # TODO: check that storage is at capacity here, if not we need to assume that the last element of end is True
+
+            # We presume that not done at the end means that the traj spans across end and beginning of storage
+            length = end.shape[0]
+
+        if not at_capacity:
             end = torch.index_fill(
                 end,
                 index=torch.tensor(-1, device=end.device, dtype=torch.long),
                 dim=0,
                 value=1,
             )
+        elif not end.any(0).all():
+            # we must have at least one end by traj to delimitate trajectories
+            # so if no end can be found we set it manually
+            mask = ~end.any(0, True)
+            mask = torch.cat([torch.zeros_like(end[:-1]), mask])
+            end = torch.masked_fill(mask, end, 1)
         ndim = end.ndim
         if ndim == 0:
             raise RuntimeError(
                 "Expected the end-of-trajectory signal to be at least 1-dimensional."
             )
+        return cls._end_to_start_stop(length=length, end=end)
+
+    @staticmethod
+    def _end_to_start_stop(end, length):
         # Using transpose ensures the start and stop are sorted the same way
         stop_idx = end.transpose(0, -1).nonzero()
-        beginnings = torch.cat([torch.ones_like(end[:1]), end[:-1]], 0)
-        start_idx = beginnings.transpose(0, -1).nonzero()
-        start_idx = torch.cat([start_idx[:, -1:], start_idx[:, :-1]], -1)
-        stop_idx = torch.cat([stop_idx[:, -1:], stop_idx[:, :-1]], -1)
-
+        stop_idx[:, [0, -1]] = stop_idx[:, [-1, 0]].clone()
+        # First build the start indices as the stop + 1, we'll shift it later
+        start_idx = stop_idx.clone()
+        start_idx[:, 0] += 1
+        start_idx[:, 0] %= end.shape[0]
+        # shift start: to do this, we check when the non-first dim indices are identical
+        # and get a mask like [False, True, True, False, True, ...] where False means
+        # that there's a switch from one dim to another (ie, a switch from one element of the batch
+        # to another). We roll this one step along the time dimension and these two
+        # masks provide us with the indices of the permutation matrix we need
+        # to apply to start_idx.
+        start_idx_mask = (start_idx[1:, 1:] == start_idx[:-1, 1:]).all(-1)
+        m1 = torch.cat([torch.zeros_like(start_idx_mask[:1]), start_idx_mask])
+        m2 = torch.cat([start_idx_mask, torch.zeros_like(start_idx_mask[:1])])
+        start_idx_replace = torch.empty_like(start_idx)
+        start_idx_replace[m1] = start_idx[m2]
+        start_idx_replace[~m1] = start_idx[~m2]
+        start_idx = start_idx_replace
         lengths = stop_idx[:, 0] - start_idx[:, 0] + 1
+        lengths[lengths < 0] = lengths[lengths < 0] + length
         return start_idx, stop_idx, lengths
 
-    def _tensor_slices_from_startend(self, seq_length, start):
+    def _start_to_end(self, st: torch.Tensor, length: int):
+        arange = torch.arange(length, device=st.device, dtype=st.dtype)
+        ndims = st.shape[-1] - 1 if st.ndim else 0
+        if ndims:
+            arange = torch.stack([arange] + [torch.zeros_like(arange)] * ndims, -1)
+        else:
+            arange = arange.unsqueeze(-1)
+        if st.shape != arange.shape:
+            # we do this to make sure that we're not broadcasting the start
+            # wrong as a tensor with shape [N] can't be expanded to [N, 1]
+            # without getting an error
+            st = st.expand_as(arange)
+        return arange + st
+
+    def _tensor_slices_from_startend(self, seq_length, start, storage_length):
         # start is a 2d tensor resulting from nonzero()
         # seq_length is a 1d tensor indicating the desired length of each sequence
-        def _start_to_end(st: torch.Tensor, length: int):
-            arange = torch.arange(length, device=st.device, dtype=st.dtype)
-            ndims = st.shape[-1] - 1 if st.ndim else 0
-            arange = torch.stack([arange] + [torch.zeros_like(arange)] * ndims, -1)
-            if st.shape != arange.shape:
-                # we do this to make sure that we're not broadcasting the start
-                # wrong as a tensor with shape [N] can't be expanded to [N, 1]
-                # without getting an error
-                st = st.expand_as(arange)
-            return arange + st
 
         if isinstance(seq_length, int):
             result = torch.cat(
-                [_start_to_end(_start, length=seq_length) for _start in start]
+                [self._start_to_end(_start, length=seq_length) for _start in start]
             )
         else:
             # when padding is needed
             result = torch.cat(
                 [
-                    _start_to_end(_start, _seq_len)
+                    self._start_to_end(_start, _seq_len)
                     for _start, _seq_len in zip(start, seq_length)
                 ]
             )
+        result[:, 0] = result[:, 0] % storage_length
         return result
 
     def _get_stop_and_length(self, storage, fallback=True):
@@ -832,15 +952,19 @@ class SliceSampler(Sampler):
             # We first try with the traj_key
             try:
                 if isinstance(storage, TensorStorage):
-                    trajectory = storage._storage.get(self._used_traj_key)
+                    trajectory = storage[:].get(self._used_traj_key)
                 else:
                     try:
                         trajectory = storage[:].get(self.traj_key)
+                    except KeyError:
+                        raise
                     except Exception:
                         raise RuntimeError(
                             "Could not get a tensordict out of the storage, which is required for SliceSampler to compute the trajectories."
                         )
-                vals = self._find_start_stop_traj(trajectory=trajectory[: len(storage)])
+                vals = self._find_start_stop_traj(
+                    trajectory=trajectory, at_capacity=storage._is_full
+                )
                 if self.cache_values:
                     self._cache["stop-and-length"] = vals
                 return vals
@@ -854,11 +978,15 @@ class SliceSampler(Sampler):
             try:
                 try:
                     done = storage[:].get(self.end_key)
+                except KeyError:
+                    raise
                 except Exception:
                     raise RuntimeError(
                         "Could not get a tensordict out of the storage, which is required for SliceSampler to compute the trajectories."
                     )
-                vals = self._find_start_stop_traj(end=done.squeeze()[: len(storage)])
+                vals = self._find_start_stop_traj(
+                    end=done.squeeze()[: len(storage)], at_capacity=storage._is_full
+                )
                 if self.cache_values:
                     self._cache["stop-and-length"] = vals
                 return vals
@@ -872,14 +1000,16 @@ class SliceSampler(Sampler):
         if self.num_slices is not None:
             if batch_size % self.num_slices != 0:
                 raise RuntimeError(
-                    f"The batch-size must be divisible by the number of slices, got batch_size={batch_size} and num_slices={self.num_slices}."
+                    f"The batch-size must be divisible by the number of slices, got "
+                    f"batch_size={batch_size} and num_slices={self.num_slices}."
                 )
             seq_length = batch_size // self.num_slices
             num_slices = self.num_slices
         else:
             if batch_size % self.slice_len != 0:
                 raise RuntimeError(
-                    f"The batch-size must be divisible by the slice length, got batch_size={batch_size} and slice_len={self.slice_len}."
+                    f"The batch-size must be divisible by the slice length, got "
+                    f"batch_size={batch_size} and slice_len={self.slice_len}."
                 )
             seq_length = self.slice_len
             num_slices = batch_size // self.slice_len
@@ -898,29 +1028,102 @@ class SliceSampler(Sampler):
                 "instead."
             )
         seq_length, num_slices = self._adjusted_batch_size(batch_size)
-        return self._sample_slices(lengths, start_idx, stop_idx, seq_length, num_slices)
+        storage_length = storage.shape[0]
+        return self._sample_slices(
+            lengths,
+            start_idx,
+            stop_idx,
+            seq_length,
+            num_slices,
+            storage_length=storage_length,
+        )
 
     def _sample_slices(
-        self, lengths, start_idx, stop_idx, seq_length, num_slices, traj_idx=None
+        self,
+        lengths: torch.Tensor,
+        start_idx: torch.Tensor,
+        stop_idx: torch.Tensor,
+        seq_length: int,
+        num_slices: int,
+        storage_length: int,
+        traj_idx: torch.Tensor | None = None,
     ) -> Tuple[Tuple[torch.Tensor, ...], Dict[str, Any]]:
-        if traj_idx is None:
-            traj_idx = torch.randint(
-                lengths.shape[0], (num_slices,), device=lengths.device
-            )
-        else:
-            num_slices = traj_idx.shape[0]
+        # start_idx and stop_idx are 2d tensors organized like a non-zero
+
+        def get_traj_idx(maxval):
+            return torch.randint(maxval, (num_slices,), device=lengths.device)
 
         if (lengths < seq_length).any():
             if self.strict_length:
-                raise RuntimeError(
-                    "Some stored trajectories have a length shorter than the slice that was asked for ("
-                    f"min length={lengths.min()}). "
-                    "Create the sampler with `strict_length=False` to allow shorter trajectories to appear "
-                    "in you batch."
-                )
-            # make seq_length a tensor with values clamped by lengths
-            seq_length = lengths[traj_idx].clamp_max(seq_length)
+                idx = lengths >= seq_length
+                if not idx.any():
+                    raise RuntimeError(
+                        f"Did not find a single trajectory with sufficient length (length range: {lengths.min()} - {lengths.max()} / required={seq_length}))."
+                    )
+                if (
+                    isinstance(seq_length, torch.Tensor)
+                    and seq_length.shape == lengths.shape
+                ):
+                    seq_length = seq_length[idx]
+                lengths_idx = lengths[idx]
+                start_idx = start_idx[idx]
+                stop_idx = stop_idx[idx]
 
+                if traj_idx is None:
+                    traj_idx = get_traj_idx(lengths_idx.shape[0])
+                else:
+                    # Here we must filter out the indices that correspond to trajectories
+                    # we don't want to keep. That could potentially lead to an empty sample.
+                    # The difficulty with this adjustment is that traj_idx points to a full
+                    # sequences of lengths, but we filter out part of it so we must
+                    # convert traj_idx to a boolean mask, index this mask with the
+                    # valid indices and then recover the nonzero.
+                    idx_mask = torch.zeros_like(idx)
+                    idx_mask[traj_idx] = True
+                    traj_idx = idx_mask[idx].nonzero().squeeze(-1)
+                    if not traj_idx.numel():
+                        raise RuntimeError(
+                            "None of the provided indices pointed to a trajectory of "
+                            "sufficient length. Consider using strict_length=False for the "
+                            "sampler instead."
+                        )
+                    num_slices = traj_idx.shape[0]
+
+                del idx
+                lengths = lengths_idx
+            else:
+                if traj_idx is None:
+                    traj_idx = get_traj_idx(lengths.shape[0])
+                else:
+                    num_slices = traj_idx.shape[0]
+
+                # make seq_length a tensor with values clamped by lengths
+                seq_length = lengths[traj_idx].clamp_max(seq_length)
+        else:
+            if traj_idx is None:
+                traj_idx = get_traj_idx(lengths.shape[0])
+            else:
+                num_slices = traj_idx.shape[0]
+        return self._get_index(
+            lengths=lengths,
+            start_idx=start_idx,
+            stop_idx=stop_idx,
+            num_slices=num_slices,
+            seq_length=seq_length,
+            storage_length=storage_length,
+            traj_idx=traj_idx,
+        )
+
+    def _get_index(
+        self,
+        lengths: torch.Tensor,
+        start_idx: torch.Tensor,
+        stop_idx: torch.Tensor,
+        seq_length: int,
+        num_slices: int,
+        storage_length: int,
+        traj_idx: torch.Tensor | None = None,
+    ) -> Tuple[torch.Tensor, dict]:
         relative_starts = (
             (
                 torch.rand(num_slices, device=lengths.device)
@@ -931,12 +1134,12 @@ class SliceSampler(Sampler):
         )
         starts = torch.cat(
             [
-                start_idx[traj_idx, :1] + relative_starts.unsqueeze(-1),
+                (start_idx[traj_idx, 0] + relative_starts).unsqueeze(1),
                 start_idx[traj_idx, 1:],
             ],
             1,
         )
-        index = self._tensor_slices_from_startend(seq_length, starts)
+        index = self._tensor_slices_from_startend(seq_length, starts, storage_length)
         if self.truncated_key is not None:
             truncated_key = self.truncated_key
             done_key = _replace_last(truncated_key, "done")
@@ -957,9 +1160,9 @@ class SliceSampler(Sampler):
             terminated = torch.zeros_like(truncated)
             if traj_terminated.any():
                 if isinstance(seq_length, int):
-                    truncated.view(num_slices, -1)[traj_terminated] = 1
+                    terminated.view(num_slices, -1)[traj_terminated, -1] = 1
                 else:
-                    truncated[(seq_length.cumsum(0) - 1)[traj_terminated]] = 1
+                    terminated[(seq_length.cumsum(0) - 1)[traj_terminated]] = 1
             truncated = truncated & ~terminated
             done = terminated | truncated
             return index.to(torch.long).unbind(-1), {
@@ -1003,11 +1206,6 @@ class SliceSampler(Sampler):
     def load_state_dict(self, state_dict: Dict[str, Any]) -> None:
         ...
 
-    def __getstate__(self):
-        state = copy(self.__dict__)
-        state["_cache"] = {}
-        return state
-
 
 class SliceSamplerWithoutReplacement(SliceSampler, SamplerWithoutReplacement):
     """Samples slices of data along the first dimension, given start and stop signals, without replacement.
@@ -1048,12 +1246,17 @@ class SliceSamplerWithoutReplacement(SliceSampler, SamplerWithoutReplacement):
             returned by the :meth:`~torchrl.data.replay_buffers.ReplayBuffer.sample` method).
         strict_length (bool, optional): if ``False``, trajectories of length
             shorter than `slice_len` (or `batch_size // num_slices`) will be
-            allowed to appear in the batch.
+            allowed to appear in the batch. If ``True``, trajectories shorted
+            than required will be filtered out.
             Be mindful that this can result in effective `batch_size`  shorter
             than the one asked for! Trajectories can be split using
             :func:`~torchrl.collectors.split_trajectories`. Defaults to ``True``.
         shuffle (bool, optional): if ``False``, the order of the trajectories
             is not shuffled. Defaults to ``True``.
+        compile (bool or dict of kwargs, optional): if ``True``, the bottleneck of
+            the :meth:`~sample` method will be compiled with :func:`~torch.compile`.
+            Keyword arguments can also be passed to torch.compile with this arg.
+            Defaults to ``False``.
 
     .. note:: To recover the trajectory splits in the storage,
         :class:`~torchrl.data.replay_buffers.samplers.SliceSamplerWithoutReplacement` will first
@@ -1128,6 +1331,7 @@ class SliceSamplerWithoutReplacement(SliceSampler, SamplerWithoutReplacement):
         truncated_key: NestedKey | None = ("next", "truncated"),
         strict_length: bool = True,
         shuffle: bool = True,
+        compile: bool | dict = False,
     ):
         SliceSampler.__init__(
             self,
@@ -1140,8 +1344,22 @@ class SliceSamplerWithoutReplacement(SliceSampler, SamplerWithoutReplacement):
             strict_length=strict_length,
             ends=ends,
             trajectories=trajectories,
+            compile=compile,
         )
         SamplerWithoutReplacement.__init__(self, drop_last=drop_last, shuffle=shuffle)
+
+    def __repr__(self):
+        perc = len(self._sample_list) / self.len_storage * 100
+        return (
+            f"{self.__class__.__name__}("
+            f"num_slices={self.num_slices}, "
+            f"slice_len={self.slice_len}, "
+            f"end_key={self.end_key}, "
+            f"traj_key={self.traj_key}, "
+            f"truncated_key={self.truncated_key}, "
+            f"strict_length={self.strict_length},"
+            f"{perc}% sampled)"
+        )
 
     def _empty(self):
         self._cache = {}
@@ -1167,8 +1385,25 @@ class SliceSamplerWithoutReplacement(SliceSampler, SamplerWithoutReplacement):
         # first get indices of the trajectories we want to retrieve
         seq_length, num_slices = self._adjusted_batch_size(batch_size)
         indices, _ = SamplerWithoutReplacement.sample(self, storage, num_slices)
+        storage_length = storage.shape[0]
+
+        # traj_idx will either be a single tensor or a tuple that can be reorganized
+        # like a non-zero through stacking.
+        def tuple_to_tensor(traj_idx, lengths=lengths):
+            if isinstance(traj_idx, tuple):
+                traj_idx = torch.arange(len(storage), device=lengths.device).view(
+                    storage.shape
+                )[traj_idx]
+            return traj_idx
+
         idx, info = self._sample_slices(
-            lengths, start_idx, stop_idx, seq_length, num_slices, traj_idx=indices
+            lengths,
+            start_idx,
+            stop_idx,
+            seq_length,
+            num_slices,
+            storage_length,
+            traj_idx=tuple_to_tensor(indices),
         )
         return idx, info
 
@@ -1218,7 +1453,25 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
             or when this signal is readily available. Must be used with ``cache_values=True``
             and cannot be used in conjunction with ``end_key`` or ``traj_key``.
         cache_values (bool, optional): to be used with static datasets.
-            Will cache the start and end signal of the trajectory.
+            Will cache the start and end signal of the trajectory. This can be safely used even
+            if the trajectory indices change during calls to :class:`~torchrl.data.ReplayBuffer.extend`
+            as this operation will erase the cache.
+
+            .. warning:: ``cache_values=True`` will not work if the sampler is used with a
+                storage that is extended by another buffer. For instance:
+
+                    >>> buffer0 = ReplayBuffer(storage=storage,
+                    ...     sampler=SliceSampler(num_slices=8, cache_values=True),
+                    ...     writer=ImmutableWriter())
+                    >>> buffer1 = ReplayBuffer(storage=storage,
+                    ...     sampler=other_sampler)
+                    >>> # Wrong! Does not erase the buffer from the sampler of buffer0
+                    >>> buffer1.extend(data)
+
+            .. warning:: ``cache_values=True`` will not work as expected if the buffer is
+                shared between processes and one process is responsible for writing
+                and one process for sampling, as erasing the cache can only be done locally.
+
         truncated_key (NestedKey, optional): If not ``None``, this argument
             indicates where a truncated signal should be written in the output
             data. This is used to indicate to value estimators where the provided
@@ -1228,10 +1481,15 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
             returned by the :meth:`~torchrl.data.replay_buffers.ReplayBuffer.sample` method).
         strict_length (bool, optional): if ``False``, trajectories of length
             shorter than `slice_len` (or `batch_size // num_slices`) will be
-            allowed to appear in the batch.
+            allowed to appear in the batch. If ``True``, trajectories shorted
+            than required will be filtered out.
             Be mindful that this can result in effective `batch_size`  shorter
             than the one asked for! Trajectories can be split using
             :func:`~torchrl.collectors.split_trajectories`. Defaults to ``True``.
+        compile (bool or dict of kwargs, optional): if ``True``, the bottleneck of
+            the :meth:`~sample` method will be compiled with :func:`~torch.compile`.
+            Keyword arguments can also be passed to torch.compile with this arg.
+            Defaults to ``False``.
 
     Examples:
         >>> import torch
@@ -1288,6 +1546,7 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
         cache_values: bool = False,
         truncated_key: NestedKey | None = ("next", "truncated"),
         strict_length: bool = True,
+        compile: bool | dict = False,
     ):
         SliceSampler.__init__(
             self,
@@ -1300,6 +1559,7 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
             strict_length=strict_length,
             ends=ends,
             trajectories=trajectories,
+            compile=compile,
         )
         PrioritizedSampler.__init__(
             self,
@@ -1311,9 +1571,32 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
             reduction=reduction,
         )
 
+    def __repr__(self):
+        if self._sample_list is not None:
+            perc = len(self._sample_list) / self.len_storage * 100
+        else:
+            perc = 0.0
+        return (
+            f"{self.__class__.__name__}("
+            f"num_slices={self.num_slices}, "
+            f"slice_len={self.slice_len}, "
+            f"end_key={self.end_key}, "
+            f"traj_key={self.traj_key}, "
+            f"truncated_key={self.truncated_key}, "
+            f"strict_length={self.strict_length},"
+            f"alpha={self._alpha}, "
+            f"beta={self._beta}, "
+            f"eps={self._eps},"
+            f"{perc: 4.4f}% filled)"
+        )
+
     def __getstate__(self):
         state = SliceSampler.__getstate__(self)
         state.update(PrioritizedSampler.__getstate__(self))
+
+    def extend(self, index: torch.Tensor) -> None:
+        super(PrioritizedSampler, self).extend(index)
+        return super(SliceSampler, self).extend(index)
 
     def sample(self, storage: Storage, batch_size: int) -> Tuple[torch.Tensor, dict]:
         # Sample `batch_size` indices representing the start of a slice.
@@ -1334,7 +1617,7 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
             # make seq_length a tensor with values clamped by lengths
             seq_length = lengths[traj_idx].clamp_max(seq_length)
 
-        # build a list of index that we dont want to sample: all the steps at a `seq_length` distance of
+        # build a list of index that we don't want to sample: all the steps at a `seq_length` distance of
         # the end the trajectory, with the end of trajectory (`stop_idx`) included
         if not isinstance(seq_length, int):
             try:
@@ -1379,7 +1662,9 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
         info["_weight"] = torch.as_tensor(info["_weight"], device=lengths.device)
 
         # extends starting indices of each slice with sequence_length to get indices of all steps
-        index = self._tensor_slices_from_startend(seq_length, starts)
+        index = self._tensor_slices_from_startend(
+            seq_length, starts, storage_length=storage.shape[0]
+        )
 
         # repeat the weight of each slice to match the number of steps
         info["_weight"] = torch.repeat_interleave(info["_weight"], seq_length)
@@ -1441,9 +1726,9 @@ class PrioritizedSliceSampler(SliceSampler, PrioritizedSampler):
             terminated = torch.zeros_like(truncated)
             if traj_terminated.any():
                 if isinstance(seq_length, int):
-                    truncated.view(num_slices, -1)[traj_terminated] = 1
+                    terminated.view(num_slices, -1)[:, traj_terminated] = 1
                 else:
-                    truncated[(seq_length.cumsum(0) - 1)[traj_terminated]] = 1
+                    terminated[(seq_length.cumsum(0) - 1)[traj_terminated]] = 1
             truncated = truncated & ~terminated
             done = terminated | truncated
 
@@ -1496,7 +1781,7 @@ class SamplerEnsemble(Sampler):
       The indices provided in the info dictionary are placed in a :class:`~tensordict.TensorDict` with
       keys ``index`` and ``buffer_ids`` that allow the upper :class:`~torchrl.data.ReplayBufferEnsemble`
       and :class:`~torchrl.data.StorageEnsemble` objects to retrieve the data.
-      This format is different than with other samplers which usually return indices
+      This format is different from with other samplers which usually return indices
       as regular tensors.
 
     """
@@ -1564,7 +1849,7 @@ class SamplerEnsemble(Sampler):
                 ]
             )
         samples = [
-            sample if isinstance(sample, torch.Tensor) else torch.tensor(sample)
+            sample if isinstance(sample, torch.Tensor) else torch.stack(sample, -1)
             for sample in samples
         ]
         if all(samples[0].shape == sample.shape for sample in samples[1:]):
@@ -1665,4 +1950,4 @@ class SamplerEnsemble(Sampler):
 
     def __repr__(self):
         samplers = textwrap.indent(f"samplers={self._samplers}", " " * 4)
-        return f"SamplerEnsemble(\n{samplers})"
+        return f"{self.__class__.__name__}(\n{samplers})"
