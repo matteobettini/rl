@@ -6425,6 +6425,7 @@ class InitTracker(Transform):
 
     Args:
          init_key (NestedKey, optional): the key to be used for the tracker entry.
+            In case of multiple _reset flags, this key is used as the leaf replacement for each.
 
     Examples:
         >>> from torchrl.envs.libs.gym import GymEnv
@@ -6438,9 +6439,11 @@ class InitTracker(Transform):
 
     """
 
-    def __init__(self, init_key: NestedKey = "is_init"):
+    def __init__(self, init_key: str = "is_init"):
         if not isinstance(init_key, str):
-            raise ValueError("init_key can only be of type str.")
+            raise ValueError(
+                "init_key can only be of type str as it will be the leaf key associated to each reset flag."
+            )
         self.init_key = init_key
         super().__init__()
 
