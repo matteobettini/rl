@@ -7,15 +7,29 @@ import time
 import hydra
 import torch
 
-from tensordict.nn import TensorDictModule
+import torchrl.modules
+from tensordict.nn import TensorDictModule, TensorDictSequential
 from tensordict.nn.distributions import NormalParamExtractor
+
+from tensordict.utils import expand_as_right
 from torch import nn
+
 from torchrl._utils import logger as torchrl_logger
 from torchrl.collectors import SyncDataCollector
-from torchrl.data import TensorDictReplayBuffer
+from torchrl.data import (
+    CompositeSpec,
+    TensorDictReplayBuffer,
+    UnboundedContinuousTensorSpec,
+)
 from torchrl.data.replay_buffers.samplers import SamplerWithoutReplacement
 from torchrl.data.replay_buffers.storages import LazyTensorStorage
-from torchrl.envs import RewardSum, TransformedEnv
+from torchrl.envs import (
+    Compose,
+    InitTracker,
+    RewardSum,
+    TensorDictPrimer,
+    TransformedEnv,
+)
 from torchrl.envs.libs.vmas import VmasEnv
 from torchrl.envs.utils import ExplorationType, set_exploration_type
 from torchrl.modules import ProbabilisticActor, TanhNormal, ValueOperator
@@ -27,6 +41,101 @@ from utils.utils import DoneTransform
 
 def rendering_callback(env, td):
     env.frames.append(env.render(mode="rgb_array", agent_index_focus=None))
+
+
+class MultiAgentGRU(torch.nn.Module):
+    def __init__(self, training, input_size, hidden_size, n_agents, device, gru=None):
+        super().__init__()
+        self.training = training
+        self.input_size = input_size
+        self.n_agents = n_agents
+        self.hidden_size = hidden_size
+        self.device = device
+        if gru is None:
+            self.gru = torchrl.modules.GRUCell(
+                input_size, hidden_size, device=self.device
+            )
+        else:
+            self.gru = gru
+
+        self.vmap_rnn = self.get_for_loop(self.gru)
+        # self.vmap_rnn_compiled = torch.compile(
+        #     self.vmap_rnn, mode="reduce-overhead", fullgraph=True
+        # )
+
+    def get_training(self):
+        return MultiAgentGRU(
+            training=True,
+            input_size=self.input_size,
+            hidden_size=self.hidden_size,
+            n_agents=self.n_agents,
+            gru=self.gru,
+            device=self.device,
+        )
+
+    def forward(
+        self,
+        input,
+        is_init,
+        h_0=None,
+    ):
+        assert is_init is not None, "We need to pass is_init"
+        if (
+            not self.training
+        ):  # In collection we emulate the sequence dimension and we have the hidden state
+            input = input.unsqueeze(1)
+            assert h_0 is not None
+        else:  # In training we have the sequence dimension and we do not have an initial state
+            assert h_0 is None
+
+        # Check input
+        batch = input.shape[0]
+        seq = input.shape[1]
+        assert input.shape == (batch, seq, self.n_agents, self.input_size)
+
+        if h_0 is not None:  # Collection
+            assert h_0.shape == (
+                batch,
+                self.n_agents,
+                self.hidden_size,
+            )
+            if is_init is not None:  # Set hidden to 0 when is_init
+                h_0 = torch.where(expand_as_right(is_init, h_0), 0, h_0)
+
+        if not self.training:  # If in collection emulate the sequence dimension
+            is_init = is_init.unsqueeze(1)
+        assert is_init.shape == (batch, seq, 1)
+        is_init = is_init.unsqueeze(-2).expand(batch, seq, self.n_agents, 1)
+
+        if h_0 is None:
+            h_0 = torch.zeros(
+                batch,
+                self.n_agents,
+                self.hidden_size,
+                device=self.device,
+                dtype=torch.float,
+            )
+        output = self.vmap_rnn(input, is_init, h_0)
+        h_n = output[..., -1, :, :]
+
+        if not self.training:
+            output = output.squeeze(1)
+        return output, h_n
+
+    # @torch.compile(mode="reduce-overhead", fullgraph=True)
+
+    @staticmethod
+    def get_for_loop(rnn):
+        def for_loop(input, is_init, h, time_dim=-3):
+            hs = []
+            for in_t, init_t in zip(input.unbind(time_dim), is_init.unbind(time_dim)):
+                h = torch.where(init_t, 0, h)
+                h = rnn(in_t, h)
+                hs.append(h)
+            output = torch.stack(hs, time_dim)
+            return output
+
+        return torch.vmap(for_loop)
 
 
 @hydra.main(version_base="1.1", config_path="", config_name="mappo_ippo")
@@ -41,7 +150,8 @@ def train(cfg: "DictConfig"):  # noqa: F821
     # Sampling
     cfg.env.vmas_envs = cfg.collector.frames_per_batch // cfg.env.max_steps
     cfg.collector.total_frames = cfg.collector.frames_per_batch * cfg.collector.n_iters
-    cfg.buffer.memory_size = cfg.collector.frames_per_batch
+    collector_time_dim = -(-cfg.collector.frames_per_batch // cfg.env.vmas_envs)
+    cfg.buffer.memory_size = cfg.env.vmas_envs
 
     # Create env and env_test
     env = VmasEnv(
@@ -54,9 +164,38 @@ def train(cfg: "DictConfig"):  # noqa: F821
         # Scenario kwargs
         **cfg.env.scenario,
     )
+
+    def get_rnn_transforms(env):
+        transforms = [
+            InitTracker(init_key="is_init"),
+            TensorDictPrimer(
+                {
+                    "agents": CompositeSpec(
+                        {
+                            "_h": UnboundedContinuousTensorSpec(
+                                shape=(*env.shape, env.n_agents, 128)
+                            )
+                        },
+                        shape=(*env.shape, env.n_agents),
+                    )
+                }
+            ),
+        ]
+        return transforms
+
     env = TransformedEnv(
         env,
-        RewardSum(in_keys=[env.reward_key], out_keys=[("agents", "episode_reward")]),
+        Compose(
+            *(
+                (get_rnn_transforms(env) if cfg.model.use_rnn else [])
+                + [
+                    RewardSum(
+                        in_keys=[env.reward_key],
+                        out_keys=[("agents", "episode_reward")],
+                    )
+                ]
+            )
+        ),
     )
 
     env_test = VmasEnv(
@@ -69,29 +208,81 @@ def train(cfg: "DictConfig"):  # noqa: F821
         # Scenario kwargs
         **cfg.env.scenario,
     )
+    env_test = TransformedEnv(
+        env_test, Compose(*(get_rnn_transforms(env_test) if cfg.model.use_rnn else []))
+    )
+    gru = MultiAgentGRU(
+        training=False,
+        input_size=env.observation_spec["agents", "observation"].shape[-1],
+        n_agents=env.n_agents,
+        hidden_size=128,
+        device=cfg.train.device,
+    )
+
+    gru_module = TensorDictModule(
+        gru,
+        in_keys=[
+            ("agents", "observation"),
+            "is_init",
+            ("agents", "_h"),
+        ],
+        out_keys=[("agents", "intermediate"), ("next", "agents", "_h")],
+    )
+    gru_module_training = TensorDictModule(
+        gru.get_training(),
+        in_keys=[("agents", "observation"), "is_init"],
+        out_keys=[("agents", "intermediate"), "_"],
+    )
 
     # Policy
-    actor_net = nn.Sequential(
-        MultiAgentMLP(
-            n_agent_inputs=env.observation_spec["agents", "observation"].shape[-1],
-            n_agent_outputs=2 * env.action_spec.shape[-1],
-            n_agents=env.n_agents,
-            centralised=False,
-            share_params=cfg.model.shared_parameters,
-            device=cfg.train.device,
-            depth=2,
-            num_cells=256,
-            activation_class=nn.Tanh,
-        ),
-        NormalParamExtractor(),
-    )
     policy_module = TensorDictModule(
-        actor_net,
-        in_keys=[("agents", "observation")],
+        nn.Sequential(
+            MultiAgentMLP(
+                n_agent_inputs=128
+                if cfg.model.use_rnn
+                else env.observation_spec["agents", "observation"].shape[-1],
+                n_agent_outputs=2 * env.action_spec.shape[-1],
+                n_agents=env.n_agents,
+                centralised=False,
+                share_params=cfg.model.shared_parameters,
+                device=cfg.train.device,
+                depth=2,
+                num_cells=256,
+                activation_class=nn.Tanh,
+            ),
+            NormalParamExtractor(),
+        ),
+        in_keys=[("agents", "intermediate")]
+        if cfg.model.use_rnn
+        else [("agents", "observation")],
         out_keys=[("agents", "loc"), ("agents", "scale")],
     )
+
+    actor_module = (
+        TensorDictSequential(gru_module, policy_module)
+        if cfg.model.use_rnn
+        else policy_module
+    )
+    actor_module_training = (
+        TensorDictSequential(gru_module_training, policy_module)
+        if cfg.model.use_rnn
+        else policy_module
+    )
+
     policy = ProbabilisticActor(
-        module=policy_module,
+        module=actor_module,
+        spec=env.unbatched_action_spec,
+        in_keys=[("agents", "loc"), ("agents", "scale")],
+        out_keys=[env.action_key],
+        distribution_class=TanhNormal,
+        distribution_kwargs={
+            "low": env.unbatched_action_spec[("agents", "action")].space.low,
+            "high": env.unbatched_action_spec[("agents", "action")].space.high,
+        },
+        return_log_prob=True,
+    )
+    policy_training = ProbabilisticActor(
+        module=actor_module_training,
         spec=env.unbatched_action_spec,
         in_keys=[("agents", "loc"), ("agents", "scale")],
         out_keys=[env.action_key],
@@ -133,12 +324,12 @@ def train(cfg: "DictConfig"):  # noqa: F821
     replay_buffer = TensorDictReplayBuffer(
         storage=LazyTensorStorage(cfg.buffer.memory_size, device=cfg.train.device),
         sampler=SamplerWithoutReplacement(),
-        batch_size=cfg.train.minibatch_size,
+        batch_size=-(-cfg.train.minibatch_size // collector_time_dim),
     )
 
     # Loss
     loss_module = ClipPPOLoss(
-        actor_network=policy,
+        actor_network=policy_training,
         critic_network=value_module,
         clip_epsilon=cfg.loss.clip_epsilon,
         entropy_coef=cfg.loss.entropy_eps,
@@ -180,13 +371,14 @@ def train(cfg: "DictConfig"):  # noqa: F821
             )
         current_frames = tensordict_data.numel()
         total_frames += current_frames
-        data_view = tensordict_data.reshape(-1)
-        replay_buffer.extend(data_view)
+        replay_buffer.extend(tensordict_data)
 
         training_tds = []
         training_start = time.time()
         for _ in range(cfg.train.num_epochs):
-            for _ in range(cfg.collector.frames_per_batch // cfg.train.minibatch_size):
+            for _ in range(
+                -(-cfg.collector.frames_per_batch // cfg.train.minibatch_size)
+            ):
                 subdata = replay_buffer.sample()
                 loss_vals = loss_module(subdata)
                 training_tds.append(loss_vals.detach())
