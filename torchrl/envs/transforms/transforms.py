@@ -4579,7 +4579,7 @@ class TensorDictPrimer(Transform):
         self.reset_key = reset_key
 
         # sanity check
-        for spec in self.primers.values():
+        for spec in self.primers.values(True, True):
             if not isinstance(spec, TensorSpec):
                 raise ValueError(
                     "The values of the primers must be a subtype of the TensorSpec class. "
@@ -4638,8 +4638,20 @@ class TensorDictPrimer(Transform):
             raise ValueError(
                 f"observation_spec was expected to be of type CompositeSpec. Got {type(observation_spec)} instead."
             )
+        try:
+            device = observation_spec.device
+        except RuntimeError:
+            device = self.device
+        primers = self.primers.clone()
+        if self.primers.shape != observation_spec.shape:
+            try:
+                # We try to set the primer shape to the observation spec shape
+                primers.shape = observation_spec.shape
+            except ValueError:
+                # If we fail, we expnad them to that shape
+                primers = self._expand_shape(primers)
 
-        observation_spec.update(self.primers)
+        observation_spec.update(primers.to(device))
         return observation_spec
 
     def transform_input_spec(self, input_spec: TensorSpec) -> TensorSpec:
