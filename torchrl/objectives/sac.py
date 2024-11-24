@@ -712,18 +712,14 @@ class SACLoss(LossModule):
                 ExplorationType.RANDOM
             ), self.actor_network_params.to_module(self.actor_network):
                 next_tensordict = tensordict.get("next").copy()
-                # Check done state and avoid passing these to the actor
-                done = next_tensordict.get(self.tensor_keys.done)
-                if done is not None and done.any():
-                    next_tensordict_select = next_tensordict[~done.squeeze(-1)]
-                else:
-                    next_tensordict_select = next_tensordict
-                next_dist = self.actor_network.get_dist(next_tensordict_select)
+                next_dist = self.actor_network.get_dist(next_tensordict)
                 next_action = next_dist.rsample()
                 next_sample_log_prob = compute_log_prob(
                     next_dist, next_action, self.tensor_keys.log_prob
                 )
-                if next_tensordict_select is not next_tensordict:
+                # Mask out done states
+                done = next_tensordict.get(self.tensor_keys.done)
+                if done is not None and done.any():
                     mask = ~done.squeeze(-1)
                     if mask.ndim < next_action.ndim:
                         mask = expand_right(
@@ -1218,21 +1214,15 @@ class DiscreteSACLoss(LossModule):
         with torch.no_grad():
             next_tensordict = tensordict.get("next").clone(False)
 
-            done = next_tensordict.get(self.tensor_keys.done)
-            if done is not None and done.any():
-                next_tensordict_select = next_tensordict[~done.squeeze(-1)]
-            else:
-                next_tensordict_select = next_tensordict
-
             # get probs and log probs for actions computed from "next"
             with self.actor_network_params.to_module(self.actor_network):
-                next_dist = self.actor_network.get_dist(next_tensordict_select)
+                next_dist = self.actor_network.get_dist(next_tensordict)
             next_log_prob = next_dist.logits
             next_prob = next_log_prob.exp()
 
             # get q-values for all actions
             next_tensordict_expand = self._vmap_qnetworkN0(
-                next_tensordict_select, self.target_qvalue_network_params
+                next_tensordict, self.target_qvalue_network_params
             )
             next_action_value = next_tensordict_expand.get(
                 self.tensor_keys.action_value
@@ -1242,7 +1232,8 @@ class DiscreteSACLoss(LossModule):
             next_state_value = next_action_value.min(0)[0] - self._alpha * next_log_prob
             # unlike in continuous SAC, we can compute the exact expectation over all discrete actions
             next_state_value = (next_prob * next_state_value).sum(-1).unsqueeze(-1)
-            if next_tensordict_select is not next_tensordict:
+            done = next_tensordict.get(self.tensor_keys.done)
+            if done is not None and done.any():
                 mask = ~done
                 next_state_value = next_state_value.new_zeros(
                     mask.shape
