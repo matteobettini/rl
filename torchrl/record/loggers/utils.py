@@ -6,8 +6,6 @@
 
 import os
 import pathlib
-import uuid
-from datetime import datetime
 
 from torchrl.record.loggers.common import Logger
 
@@ -18,8 +16,6 @@ def generate_exp_name(model_name: str, experiment_name: str) -> str:
         (
             model_name,
             experiment_name,
-            str(uuid.uuid4())[:8],
-            datetime.now().strftime("%y_%m_%d-%H_%M_%S"),
         )
     )
     return exp_name
