@@ -175,6 +175,12 @@ class MultiAgentMLP(nn.Module):
             ]
         )
 
+    def reset_parameters(self):
+        for net in self.agent_networks:
+            for layer in net.children():
+                if hasattr(layer, "reset_parameters"):
+                    layer.reset_parameters()
+
     def forward(self, *inputs: Tuple[torch.Tensor]) -> torch.Tensor:
         if len(inputs) > 1:
             inputs = torch.cat([*inputs], -1)
