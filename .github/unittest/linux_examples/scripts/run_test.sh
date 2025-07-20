@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+#
+# Copyright (c) 2025
+#
+
 # Leave blank as code needs to start on line 29 for run_local.sh
 #
 #

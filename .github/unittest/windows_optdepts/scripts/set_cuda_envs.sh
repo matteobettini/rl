@@ -1,4 +1,8 @@
 #!/usr/bin/env bash
+#
+# Copyright (c) 2025
+#
+
 set -ex
 
 echo CU_VERSION is "${CU_VERSION}"

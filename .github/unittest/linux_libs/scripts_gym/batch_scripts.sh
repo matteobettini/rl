@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+#
+# Copyright (c) 2025
+#
+
 # Runs a batch of scripts in a row to allow docker run to keep installed libraries
 # and env variables across runs.
 

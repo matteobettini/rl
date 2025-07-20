@@ -7,6 +7,8 @@ This example illustrates how a TorchRL collector can be converted into a distrib
 This example should create 3 collector instances, 1 local and 2 remote, but 4 instances seem to
 be created. Why?
 """
+#  Copyright (c) 2025
+
 from tensordict.nn import TensorDictModule
 from torch import nn
 from torchrl._utils import logger as torchrl_logger

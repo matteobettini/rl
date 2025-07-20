@@ -18,6 +18,8 @@ Get started with Environments, TED and transforms
 
 """
 
+#  Copyright (c) 2025
+
 ################################
 # Welcome to the getting started tutorials!
 #

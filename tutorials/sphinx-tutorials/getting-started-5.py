@@ -17,6 +17,8 @@ Get started with your own first training loop
 
 """
 
+#  Copyright (c) 2025
+
 #################################
 # Time to wrap up everything we've learned so far in this Getting Started
 # series!

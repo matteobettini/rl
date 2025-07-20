@@ -41,6 +41,8 @@ Key learnings:
 
 """
 
+#  Copyright (c) 2025
+
 ######################################################################
 # To give a sense of what can be achieved with TorchRL's environments, we will
 # be designing a *stateless* environment. While stateful environments keep track of

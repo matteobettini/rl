@@ -1,5 +1,9 @@
 #!/bin/bash
 
+#
+# Copyright (c) 2025
+#
+
 set -ex
 
 if [[ "$CU_VERSION" == "cu92" ]]; then

@@ -8,6 +8,8 @@ TorchRL objectives: Coding a DDPG loss
 
 """
 
+#  Copyright (c) 2025
+
 ##############################################################################
 # Overview
 # --------

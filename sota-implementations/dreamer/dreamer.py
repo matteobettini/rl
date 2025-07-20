@@ -1,3 +1,5 @@
+#  Copyright (c) 2025
+
 import dataclasses
 from pathlib import Path
 

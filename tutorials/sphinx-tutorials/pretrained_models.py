@@ -4,6 +4,8 @@ Using pretrained models
 =======================
 This tutorial explains how to use pretrained models in TorchRL.
 """
+#  Copyright (c) 2025
+
 ##############################################################################
 # At the end of this tutorial, you will be capable of using pretrained models
 # for efficient image representation, and fine-tune them.

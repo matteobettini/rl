@@ -1,5 +1,9 @@
 #!/bin/bash
 
+#
+# Copyright (c) 2025
+#
+
 set -e
 set -v
 

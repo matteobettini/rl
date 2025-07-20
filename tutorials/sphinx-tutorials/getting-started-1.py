@@ -16,6 +16,8 @@ Get started with TorchRL's modules
         !pip install torchrl
 
 """
+#  Copyright (c) 2025
+
 ###################################
 # Reinforcement Learning is designed to create policies that can effectively
 # tackle specific tasks. Policies can take various forms, from a differentiable

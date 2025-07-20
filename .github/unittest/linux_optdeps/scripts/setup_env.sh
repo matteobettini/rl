@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+#
+# Copyright (c) 2025
+#
+
 # This script is for setting up environment in which unit test is ran.
 # To speed up the CI time, the resulting environment is cached.
 #

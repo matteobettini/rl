@@ -7,6 +7,8 @@ It focusses on how to set up a replay buffer worker that accepts remote operatio
 In this model, >= 1 data collectors workers are responsible for collecting experiences in an environment, the replay buffer worker receives all of these experiences and exposes them to a trainer that is responsible for making parameter updates to any required models.
 """
 
+#  Copyright (c) 2025
+
 import argparse
 import os
 import random

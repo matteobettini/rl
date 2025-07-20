@@ -1,3 +1,7 @@
+#
+# Copyright (c) 2025
+#
+
 # A set of useful bash functions for common functionality we need to do in
 # many build scripts
 

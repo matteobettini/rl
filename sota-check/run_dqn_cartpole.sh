@@ -1,5 +1,9 @@
 #!/bin/bash
 
+#
+# Copyright (c) 2025
+#
+
 #SBATCH --job-name=dqn_cartpole
 #SBATCH --ntasks=32
 #SBATCH --cpus-per-task=1

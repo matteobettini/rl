@@ -1,3 +1,5 @@
+#  Copyright (c) 2025
+
 import os
 
 TCP_PORT = os.environ.get("TCP_PORT", "10003")

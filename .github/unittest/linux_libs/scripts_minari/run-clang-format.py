@@ -31,6 +31,8 @@ A diff output is produced and a sensible exit code is returned.
 
 """
 
+#  Copyright (c) 2025
+
 import argparse
 import difflib
 import fnmatch

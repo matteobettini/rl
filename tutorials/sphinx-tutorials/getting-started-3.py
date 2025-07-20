@@ -17,6 +17,8 @@ Get started with data collection and storage
 
 """
 
+#  Copyright (c) 2025
+
 #################################
 #
 # There is no learning without data. In supervised learning, users are

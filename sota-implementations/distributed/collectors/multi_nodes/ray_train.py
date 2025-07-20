@@ -5,6 +5,8 @@ Train example with a distributed collector
 This script reproduces the PPO example in https://pytorch.org/rl/tutorials/coding_ppo.html
 with a RayCollector.
 """
+#  Copyright (c) 2025
+
 from collections import defaultdict
 
 import matplotlib.pyplot as plt

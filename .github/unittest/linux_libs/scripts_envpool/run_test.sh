@@ -1,5 +1,9 @@
 #!/usr/bin/env bash
 
+#
+# Copyright (c) 2025
+#
+
 # this code is supposed to run on CPU
 # rendering with the combination of packages we have here in headless mode
 # is hard to nail.

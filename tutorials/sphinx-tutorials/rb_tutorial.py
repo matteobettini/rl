@@ -8,6 +8,8 @@ Using Replay Buffers
 .. _rb_tuto:
 
 """
+#  Copyright (c) 2025
+
 ######################################################################
 # Replay buffers are a central piece of any RL or control algorithm.
 # Supervised learning methods are usually characterized by a training loop

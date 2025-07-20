@@ -8,6 +8,8 @@ TorchRL envs
 .. _envs_tuto:
 
 """
+#  Copyright (c) 2025
+
 ##############################################################################
 #
 # Environments play a crucial role in RL settings, often somewhat similar to

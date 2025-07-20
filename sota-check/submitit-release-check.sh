@@ -1,5 +1,9 @@
 #!/bin/bash
 
+#
+# Copyright (c) 2025
+#
+
 # Function to display script usage
 display_usage() {
     cat <<EOF

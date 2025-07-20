@@ -22,6 +22,8 @@ Recurrent DQN: Training recurrent policies
       * tqdm
 """
 
+#  Copyright (c) 2025
+
 #########################################################################
 # Overview
 # --------

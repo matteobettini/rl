@@ -17,6 +17,8 @@ Getting started with model optimization
 
 """
 
+#  Copyright (c) 2025
+
 ###################################
 # In TorchRL, we try to treat optimization as it is custom to do in PyTorch,
 # using dedicated loss modules which are designed with the sole purpose of

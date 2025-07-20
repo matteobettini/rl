@@ -4,6 +4,8 @@ Introduction to TorchRL
 =======================
 This demo was presented at ICML 2022 on the industry demo day.
 """
+#  Copyright (c) 2025
+
 ##############################################################################
 # It gives a good overview of TorchRL functionalities. Feel free to reach out
 # to vmoens@fb.com or submit issues if you have questions or comments about

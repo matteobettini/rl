@@ -17,6 +17,8 @@ Get started with logging
 
 """
 
+#  Copyright (c) 2025
+
 #####################################
 # The final chapter of this series before we orchestrate everything in a
 # training script is to learn about logging.

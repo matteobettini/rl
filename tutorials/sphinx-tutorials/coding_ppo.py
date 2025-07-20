@@ -36,6 +36,8 @@ We will cover six crucial components of TorchRL:
 
 """
 
+#  Copyright (c) 2025
+
 ######################################################################
 # If you are running this in Google Colab, make sure you install the following dependencies:
 #

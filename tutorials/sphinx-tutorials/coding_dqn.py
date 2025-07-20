@@ -8,6 +8,8 @@ TorchRL trainer: A DQN example
 
 """
 
+#  Copyright (c) 2025
+
 ##############################################################################
 # TorchRL provides a generic :class:`~torchrl.trainers.Trainer` class to handle
 # your training loop. The trainer executes a nested loop where the outer loop

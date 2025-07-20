@@ -1,3 +1,5 @@
+#  Copyright (c) 2025
+
 import os
 import shutil
 from pathlib import Path
